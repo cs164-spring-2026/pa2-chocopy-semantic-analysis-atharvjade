@@ -68,8 +68,8 @@ To sync with updates upstream:
 
 ## Submission writeup
 
-Team member 1: 
+Team member 1: Jade Mon
 
-Team member 2: 
+Team member 2: Atharv Sampath
 
 (Students should edit this section with their write-up)
