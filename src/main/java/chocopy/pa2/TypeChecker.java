@@ -10,15 +10,20 @@ import chocopy.common.astnodes.BinaryExpr;
 import chocopy.common.astnodes.BooleanLiteral;
 import chocopy.common.astnodes.Declaration;
 import chocopy.common.astnodes.Errors;
+import chocopy.common.astnodes.Expr;
 import chocopy.common.astnodes.ExprStmt;
+import chocopy.common.astnodes.IfExpr;
 import chocopy.common.astnodes.IfStmt;
 import chocopy.common.astnodes.Identifier;
+import chocopy.common.astnodes.IndexExpr;
 import chocopy.common.astnodes.IntegerLiteral;
+import chocopy.common.astnodes.ListExpr;
 import chocopy.common.astnodes.Node;
 import chocopy.common.astnodes.NoneLiteral;
 import chocopy.common.astnodes.Program;
 import chocopy.common.astnodes.StringLiteral;
 import chocopy.common.astnodes.Stmt;
+import chocopy.common.astnodes.UnaryExpr;
 import chocopy.common.astnodes.VarDef;
 import chocopy.common.astnodes.WhileStmt;
 
@@ -79,6 +84,29 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         return false;
     }
 
+    /** Join two expression value-types conservatively. */
+    private Type joinTypes(Type t1, Type t2) {
+        if (t1.equals(t2)) {
+            return t1;
+        }
+        if (t1.equals(Type.EMPTY_TYPE) && t2.isListType()) {
+            return t2;
+        }
+        if (t2.equals(Type.EMPTY_TYPE) && t1.isListType()) {
+            return t1;
+        }
+        if (t1.isListType() && t2.isListType()) {
+            ValueType e1 = ((ListValueType) t1).elementType();
+            ValueType e2 = ((ListValueType) t2).elementType();
+            if (e1.equals(e2)) {
+                return new ListValueType(e1);
+            } else {
+                return new ListValueType(OBJECT_TYPE);
+            }
+        }
+        return OBJECT_TYPE;
+    }
+
     @Override
     public Type analyze(Program program) {
         for (Declaration decl : program.declarations) {
@@ -137,6 +165,18 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
         switch (e.operator) {
         case "+":
+            if (INT_TYPE.equals(t1) && INT_TYPE.equals(t2)) {
+                return e.setInferredType(INT_TYPE);
+            } else if (STR_TYPE.equals(t1) && STR_TYPE.equals(t2)) {
+                return e.setInferredType(STR_TYPE);
+            } else if ((t1.isListType() || Type.EMPTY_TYPE.equals(t1))
+                       && (t2.isListType() || Type.EMPTY_TYPE.equals(t2))) {
+                return e.setInferredType(joinTypes(t1, t2));
+            } else {
+                err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
+                    e.operator, t1, t2);
+                return e.setInferredType(INT_TYPE);
+            }
         case "-":
         case "*":
         case "//":
@@ -194,7 +234,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(AssignStmt stmt) {
         Type valueType = stmt.value.dispatch(this);
-        for (chocopy.common.astnodes.Expr target : stmt.targets) {
+        for (Expr target : stmt.targets) {
+            if (target instanceof IndexExpr) {
+                Type listType = ((IndexExpr) target).list.dispatch(this);
+                if (STR_TYPE.equals(listType)) {
+                    err(target, "`str` is not a list type");
+                    continue;
+                }
+            }
             Type targetType = target.dispatch(this);
             if (!isAssignable(targetType, valueType)) {
                 err(stmt, "Expected type `%s`; got type `%s`",
@@ -232,6 +279,83 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             s.dispatch(this);
         }
         return null;
+    }
+
+    @Override
+    public Type analyze(UnaryExpr e) {
+        Type operandType = e.operand.dispatch(this);
+        switch (e.operator) {
+        case "-":
+            if (INT_TYPE.equals(operandType)) {
+                return e.setInferredType(INT_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on type `%s`",
+                    e.operator, operandType);
+                return e.setInferredType(INT_TYPE);
+            }
+        case "not":
+            if (BOOL_TYPE.equals(operandType)) {
+                return e.setInferredType(BOOL_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on type `%s`",
+                    e.operator, operandType);
+                return e.setInferredType(BOOL_TYPE);
+            }
+        default:
+            return e.setInferredType(OBJECT_TYPE);
+        }
+    }
+
+    @Override
+    public Type analyze(IfExpr e) {
+        Type condType = e.condition.dispatch(this);
+        Type thenType = e.thenExpr.dispatch(this);
+        Type elseType = e.elseExpr.dispatch(this);
+        if (!BOOL_TYPE.equals(condType)) {
+            err(e.condition, "Condition expression cannot be of type `%s`",
+                condType);
+        }
+        return e.setInferredType(joinTypes(thenType, elseType));
+    }
+
+    @Override
+    public Type analyze(ListExpr e) {
+        if (e.elements.isEmpty()) {
+            return e.setInferredType(Type.EMPTY_TYPE);
+        }
+
+        Type elemType = e.elements.get(0).dispatch(this);
+        for (int i = 1; i < e.elements.size(); i += 1) {
+            Type t = e.elements.get(i).dispatch(this);
+            elemType = joinTypes(elemType, t);
+        }
+        return e.setInferredType(new ListValueType(elemType));
+    }
+
+    @Override
+    public Type analyze(IndexExpr e) {
+        Type listType = e.list.dispatch(this);
+        Type indexType = e.index.dispatch(this);
+
+        if (!INT_TYPE.equals(indexType)) {
+            err(e, "Index is of non-integer type `%s`", indexType);
+            if (listType.isListType()) {
+                return e.setInferredType(((ListValueType) listType).elementType());
+            } else if (STR_TYPE.equals(listType)) {
+                return e.setInferredType(STR_TYPE);
+            } else {
+                return e.setInferredType(OBJECT_TYPE);
+            }
+        }
+
+        if (listType.isListType()) {
+            return e.setInferredType(((ListValueType) listType).elementType());
+        } else if (STR_TYPE.equals(listType)) {
+            return e.setInferredType(STR_TYPE);
+        } else {
+            err(e, "Cannot index into type `%s`", listType);
+            return e.setInferredType(OBJECT_TYPE);
+        }
     }
 
     @Override
