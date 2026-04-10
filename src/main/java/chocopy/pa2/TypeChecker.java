@@ -13,6 +13,7 @@ import chocopy.common.astnodes.IntegerLiteral;
 import chocopy.common.astnodes.Node;
 import chocopy.common.astnodes.Program;
 import chocopy.common.astnodes.Stmt;
+import chocopy.common.astnodes.VarDef;
 
 import static chocopy.common.analysis.types.Type.INT_TYPE;
 import static chocopy.common.analysis.types.Type.OBJECT_TYPE;
@@ -56,6 +57,20 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(ExprStmt s) {
         s.expr.dispatch(this);
+        return null;
+    }
+
+    @Override
+    public Type analyze(VarDef varDef) {
+        ValueType declaredType =
+            ValueType.annotationToValueType(varDef.var.type);
+        Type initType = varDef.value.dispatch(this);
+
+        if (!declaredType.equals(initType)) {
+            err(varDef.value, "Expected type `%s`; got type `%s`",
+                declaredType, initType);
+        }
+
         return null;
     }
 
