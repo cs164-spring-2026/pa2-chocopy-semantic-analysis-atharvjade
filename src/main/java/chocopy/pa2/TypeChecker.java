@@ -2,25 +2,31 @@ package chocopy.pa2;
 
 import chocopy.common.analysis.AbstractNodeAnalyzer;
 import chocopy.common.analysis.SymbolTable;
+import chocopy.common.analysis.types.ListValueType;
 import chocopy.common.analysis.types.Type;
 import chocopy.common.analysis.types.ValueType;
+import chocopy.common.astnodes.AssignStmt;
 import chocopy.common.astnodes.BinaryExpr;
 import chocopy.common.astnodes.BooleanLiteral;
 import chocopy.common.astnodes.Declaration;
 import chocopy.common.astnodes.Errors;
 import chocopy.common.astnodes.ExprStmt;
+import chocopy.common.astnodes.IfStmt;
 import chocopy.common.astnodes.Identifier;
 import chocopy.common.astnodes.IntegerLiteral;
 import chocopy.common.astnodes.Node;
 import chocopy.common.astnodes.NoneLiteral;
 import chocopy.common.astnodes.Program;
+import chocopy.common.astnodes.StringLiteral;
 import chocopy.common.astnodes.Stmt;
 import chocopy.common.astnodes.VarDef;
+import chocopy.common.astnodes.WhileStmt;
 
 import static chocopy.common.analysis.types.Type.BOOL_TYPE;
 import static chocopy.common.analysis.types.Type.INT_TYPE;
 import static chocopy.common.analysis.types.Type.NONE_TYPE;
 import static chocopy.common.analysis.types.Type.OBJECT_TYPE;
+import static chocopy.common.analysis.types.Type.STR_TYPE;
 
 /** Analyzer that performs ChocoPy type checks on all nodes.  Applied after
  *  collecting declarations. */
@@ -47,6 +53,32 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         errors.semError(node, message, args);
     }
 
+    /** Returns whether VALUE can be assigned to TARGET in this simplified
+     *  analyzer stage. */
+    private boolean isAssignable(Type target, Type value) {
+        if (target == null || value == null) {
+            return false;
+        }
+        if (target.equals(value)) {
+            return true;
+        }
+        if (target.equals(OBJECT_TYPE)) {
+            return value.isValueType();
+        }
+        if (value.equals(NONE_TYPE)) {
+            return !target.isSpecialType();
+        }
+        if (value.equals(Type.EMPTY_TYPE)) {
+            return target.isListType();
+        }
+        if (target.isListType() && value.isListType()) {
+            Type targetElem = ((ListValueType) target).elementType();
+            Type valueElem = ((ListValueType) value).elementType();
+            return targetElem != null && targetElem.equals(valueElem);
+        }
+        return false;
+    }
+
     @Override
     public Type analyze(Program program) {
         for (Declaration decl : program.declarations) {
@@ -70,7 +102,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             ValueType.annotationToValueType(varDef.var.type);
         Type initType = varDef.value.dispatch(this);
 
-        if (!declaredType.equals(initType)) {
+        if (!isAssignable(declaredType, initType)) {
             err(varDef.value, "Expected type `%s`; got type `%s`",
                 declaredType, initType);
         }
@@ -81,6 +113,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(IntegerLiteral i) {
         return i.setInferredType(Type.INT_TYPE);
+    }
+
+    @Override
+    public Type analyze(StringLiteral s) {
+        return s.setInferredType(STR_TYPE);
     }
 
     @Override
@@ -152,6 +189,49 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             return e.setInferredType(OBJECT_TYPE);
         }
 
+    }
+
+    @Override
+    public Type analyze(AssignStmt stmt) {
+        Type valueType = stmt.value.dispatch(this);
+        for (chocopy.common.astnodes.Expr target : stmt.targets) {
+            Type targetType = target.dispatch(this);
+            if (!isAssignable(targetType, valueType)) {
+                err(stmt, "Expected type `%s`; got type `%s`",
+                    targetType, valueType);
+                break;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public Type analyze(IfStmt stmt) {
+        Type condType = stmt.condition.dispatch(this);
+        if (!BOOL_TYPE.equals(condType)) {
+            err(stmt.condition, "Condition expression cannot be of type `%s`",
+                condType);
+        }
+        for (Stmt s : stmt.thenBody) {
+            s.dispatch(this);
+        }
+        for (Stmt s : stmt.elseBody) {
+            s.dispatch(this);
+        }
+        return null;
+    }
+
+    @Override
+    public Type analyze(WhileStmt stmt) {
+        Type condType = stmt.condition.dispatch(this);
+        if (!BOOL_TYPE.equals(condType)) {
+            err(stmt.condition, "Condition expression cannot be of type `%s`",
+                condType);
+        }
+        for (Stmt s : stmt.body) {
+            s.dispatch(this);
+        }
+        return null;
     }
 
     @Override
