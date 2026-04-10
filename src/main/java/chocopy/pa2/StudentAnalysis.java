@@ -15,8 +15,9 @@ public class StudentAnalysis {
             return program;
         }
 
+        SymbolTable<Type> globals = BuiltinTypes.newGlobalsWithBuiltins();
         DeclarationAnalyzer declarationAnalyzer =
-            new DeclarationAnalyzer(program.errors);
+            new DeclarationAnalyzer(program.errors, globals);
         program.dispatch(declarationAnalyzer);
         SymbolTable<Type> globalSym =
             declarationAnalyzer.getGlobals();
