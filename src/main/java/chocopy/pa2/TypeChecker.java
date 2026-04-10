@@ -1,5 +1,6 @@
 package chocopy.pa2;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -18,6 +19,7 @@ import chocopy.common.astnodes.BinaryExpr;
 import chocopy.common.astnodes.BooleanLiteral;
 import chocopy.common.astnodes.CallExpr;
 import chocopy.common.astnodes.ClassDef;
+import chocopy.common.astnodes.ClassType;
 import chocopy.common.astnodes.Declaration;
 import chocopy.common.astnodes.Errors;
 import chocopy.common.astnodes.Expr;
@@ -38,8 +40,10 @@ import chocopy.common.astnodes.NoneLiteral;
 import chocopy.common.astnodes.NonLocalDecl;
 import chocopy.common.astnodes.Program;
 import chocopy.common.astnodes.ReturnStmt;
+import chocopy.common.astnodes.ListType;
 import chocopy.common.astnodes.StringLiteral;
 import chocopy.common.astnodes.Stmt;
+import chocopy.common.astnodes.TypeAnnotation;
 import chocopy.common.astnodes.TypedVar;
 import chocopy.common.astnodes.UnaryExpr;
 import chocopy.common.astnodes.VarDef;
@@ -65,6 +69,16 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
     /** Names declared {@code global} in the current function. */
     private Set<String> currentGlobals = new HashSet<>();
+    /** Names declared {@code nonlocal} in the current function. */
+    private Set<String> currentNonlocals = new HashSet<>();
+    /** {@code global} names already declared in this function (duplicate check). */
+    private Set<String> globalDeclSeen = new HashSet<>();
+    /** Top-level {@code VarDef} names (valid targets of {@code global}). */
+    private Set<String> moduleVarNames = new HashSet<>();
+    /** User-defined class names plus built-in class names that cannot be shadowed. */
+    private Set<String> shadowForbiddenClassNames = new HashSet<>();
+    /** Stack of nested functions for {@code nonlocal} resolution. */
+    private final List<FuncDef> functionStack = new ArrayList<>();
     /** Expected return type of the innermost function, or null at top level. */
     private ValueType currentFunctionReturn;
     /** True while type-checking a function or method body. */
@@ -92,12 +106,33 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         errors.semError(node, message, args);
     }
 
+    private boolean isSubclassOf(String subClassName, String superClassName) {
+        if (subClassName.equals(superClassName)) {
+            return true;
+        }
+        String cn = subClassName;
+        while (cn != null) {
+            if (cn.equals(superClassName)) {
+                return true;
+            }
+            cn = classSuper.get(cn);
+        }
+        return false;
+    }
+
     private boolean isAssignable(Type target, Type value) {
         if (target == null || value == null) {
             return false;
         }
         if (target.equals(value)) {
             return true;
+        }
+        if (target instanceof ClassValueType && value instanceof ClassValueType) {
+            String tn = ((ClassValueType) target).className();
+            String vn = ((ClassValueType) value).className();
+            if (isSubclassOf(vn, tn)) {
+                return true;
+            }
         }
         if (target.equals(OBJECT_TYPE)) {
             return value.isValueType();
@@ -111,9 +146,148 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         if (target.isListType() && value.isListType()) {
             Type targetElem = ((ListValueType) target).elementType();
             Type valueElem = ((ListValueType) value).elementType();
-            return targetElem != null && targetElem.equals(valueElem);
+            if (targetElem != null && targetElem.equals(valueElem)) {
+                return true;
+            }
+            if (targetElem != null && targetElem.equals(OBJECT_TYPE)
+                && valueElem != null && valueElem.equals(NONE_TYPE)) {
+                return true;
+            }
+            return false;
         }
         return false;
+    }
+
+    /** True if CHILD overrides PARENT for a method in a subclass (self type may differ). */
+    private static boolean methodOverridesCompatible(FuncType parent, FuncType child,
+            String parentClassName, String childClassName) {
+        if (parent == null || child == null) {
+            return false;
+        }
+        if (!parent.returnType.equals(child.returnType)) {
+            return false;
+        }
+        if (parent.parameters.size() != child.parameters.size()) {
+            return false;
+        }
+        if (parent.parameters.isEmpty()) {
+            return true;
+        }
+        ValueType ps = parent.parameters.get(0);
+        ValueType cs = child.parameters.get(0);
+        if (!(ps instanceof ClassValueType) || !(cs instanceof ClassValueType)) {
+            return false;
+        }
+        if (!((ClassValueType) ps).className().equals(parentClassName)
+            || !((ClassValueType) cs).className().equals(childClassName)) {
+            return false;
+        }
+        for (int i = 1; i < parent.parameters.size(); i++) {
+            if (!parent.parameters.get(i).equals(child.parameters.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Set<String> localVariableNames(FuncDef fd) {
+        Set<String> s = new HashSet<>();
+        for (TypedVar p : fd.params) {
+            s.add(p.identifier.name);
+        }
+        for (Declaration d : fd.declarations) {
+            if (d instanceof VarDef) {
+                s.add(((VarDef) d).var.identifier.name);
+            }
+        }
+        return s;
+    }
+
+    private void checkTypeAnnotation(TypeAnnotation ann) {
+        if (ann instanceof ClassType) {
+            ClassType ct = (ClassType) ann;
+            Type t = globals.get(ct.className);
+            if (!(t instanceof ClassValueType)) {
+                String msg = "Invalid type annotation; there is no class named: "
+                    + ct.className;
+                ct.setErrorMsg(msg);
+                err(ct, "Invalid type annotation; there is no class named: %s",
+                    ct.className);
+            }
+        } else {
+            ListType lt = (ListType) ann;
+            checkTypeAnnotation(lt.elementType);
+        }
+    }
+
+    private void checkShadowClassName(Identifier id) {
+        if (shadowForbiddenClassNames.contains(id.name)) {
+            String msg = "Cannot shadow class name: " + id.name;
+            id.setErrorMsg(msg);
+            err(id, "Cannot shadow class name: %s", id.name);
+        }
+    }
+
+    private void validateClassSuper(ClassDef cd, Set<String> classesDeclaredSoFar) {
+        String sup = cd.superClass.name;
+        Type t = globals.get(sup);
+        if (t == null) {
+            cd.superClass.setErrorMsg("Super-class not defined: " + sup);
+            err(cd.superClass, "Super-class not defined: %s", sup);
+            return;
+        }
+        if (!(t instanceof ClassValueType)) {
+            err(cd.superClass, "Super-class must be a class: %s", sup);
+            return;
+        }
+        ClassValueType cvt = (ClassValueType) t;
+        if (!cvt.className().equals(sup)) {
+            err(cd.superClass, "Super-class must be a class: %s", sup);
+            return;
+        }
+        if (!classesDeclaredSoFar.contains(sup)) {
+            cd.superClass.setErrorMsg("Super-class not defined: " + sup);
+            err(cd.superClass, "Super-class not defined: %s", sup);
+            return;
+        }
+        if ("int".equals(sup) || "bool".equals(sup) || "str".equals(sup)) {
+            err(cd.superClass, "Cannot extend special class: %s", sup);
+        }
+    }
+
+    private void checkMethodSelfParam(FuncDef fd, String className) {
+        ClassValueType selfType = new ClassValueType(className);
+        if (fd.params.isEmpty()) {
+            fd.name.setErrorMsg(
+                "First parameter of the following method must be of the "
+                + "enclosing class: " + fd.name.name);
+            err(fd.name,
+                "First parameter of the following method must be of the "
+                + "enclosing class: %s",
+                fd.name.name);
+            return;
+        }
+        TypedVar first = fd.params.get(0);
+        if (!"self".equals(first.identifier.name)) {
+            fd.name.setErrorMsg(
+                "First parameter of the following method must be of the "
+                + "enclosing class: " + fd.name.name);
+            err(fd.name,
+                "First parameter of the following method must be of the "
+                + "enclosing class: %s",
+                fd.name.name);
+            return;
+        }
+        ValueType got = ValueType.annotationToValueType(first.type);
+        if (!selfType.equals(got)) {
+            fd.name.setErrorMsg(
+                "First parameter of the following method must be of the "
+                + "enclosing class: " + fd.name.name);
+            err(fd.name,
+                "First parameter of the following method must be of the "
+                + "enclosing class: %s",
+                fd.name.name);
+        }
     }
 
     private Type joinTypes(Type t1, Type t2) {
@@ -143,32 +317,91 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         String sup = cd.superClass.name;
         classSuper.put(cn, sup);
 
-        Map<String, ValueType> fields = new HashMap<>();
-        if (classFields.containsKey(sup)) {
-            fields.putAll(new HashMap<>(classFields.get(sup)));
-        }
+        Map<String, ValueType> inheritedFields =
+            classFields.containsKey(sup)
+            ? new HashMap<>(classFields.get(sup)) : new HashMap<>();
+        Map<String, FuncType> inheritedMethods =
+            classMethods.containsKey(sup)
+            ? new HashMap<>(classMethods.get(sup)) : new HashMap<>();
+
+        Map<String, ValueType> fields = new HashMap<>(inheritedFields);
+        Map<String, FuncType> methods = new HashMap<>(inheritedMethods);
+
+        Set<String> declaredInClass = new HashSet<>();
+
         for (Declaration d : cd.declarations) {
             if (d instanceof VarDef) {
                 VarDef vd = (VarDef) d;
-                fields.put(vd.var.identifier.name,
-                           ValueType.annotationToValueType(vd.var.type));
+                String fn = vd.var.identifier.name;
+                if (declaredInClass.contains(fn)) {
+                    vd.var.identifier.setErrorMsg(
+                        "Duplicate declaration of identifier in same scope: "
+                        + fn);
+                    err(vd.var.identifier,
+                        "Duplicate declaration of identifier in same scope: %s",
+                        fn);
+                    continue;
+                }
+                if (inheritedFields.containsKey(fn)
+                    || inheritedMethods.containsKey(fn)) {
+                    vd.var.identifier.setErrorMsg(
+                        "Cannot re-define attribute: " + fn);
+                    err(vd.var.identifier, "Cannot re-define attribute: %s",
+                        fn);
+                    continue;
+                }
+                declaredInClass.add(fn);
+                fields.put(fn, ValueType.annotationToValueType(vd.var.type));
+            } else if (d instanceof FuncDef) {
+                FuncDef fd = (FuncDef) d;
+                String mn = fd.name.name;
+                if (declaredInClass.contains(mn)) {
+                    fd.name.setErrorMsg(
+                        "Duplicate declaration of identifier in same scope: "
+                        + mn);
+                    err(fd.name,
+                        "Duplicate declaration of identifier in same scope: %s",
+                        mn);
+                    continue;
+                }
+                if (inheritedFields.containsKey(mn)) {
+                    fd.name.setErrorMsg("Cannot re-define attribute: " + mn);
+                    err(fd.name, "Cannot re-define attribute: %s", mn);
+                    continue;
+                }
+                FuncType childFt = DeclarationAnalyzer.funcTypeFromFuncDef(fd);
+                if ("__init__".equals(mn)) {
+                    FuncType parentCtor = classConstructorTypes.get(sup);
+                    if (parentCtor != null
+                        && !methodOverridesCompatible(parentCtor, childFt,
+                                                      sup, cn)) {
+                        fd.name.setErrorMsg(
+                            "Method overridden with different type signature: "
+                            + "__init__");
+                        err(fd.name,
+                            "Method overridden with different type signature: "
+                            + "__init__");
+                    }
+                } else {
+                    if (inheritedMethods.containsKey(mn)) {
+                        FuncType parentFt = inheritedMethods.get(mn);
+                        if (!methodOverridesCompatible(parentFt, childFt,
+                                                       sup, cn)) {
+                            fd.name.setErrorMsg(
+                                "Method overridden with different type "
+                                + "signature: " + mn);
+                            err(fd.name,
+                                "Method overridden with different type "
+                                + "signature: %s",
+                                mn);
+                        }
+                    }
+                    methods.put(mn, childFt);
+                }
+                declaredInClass.add(mn);
             }
         }
         classFields.put(cn, fields);
-
-        Map<String, FuncType> methods = new HashMap<>();
-        if (classMethods.containsKey(sup)) {
-            methods.putAll(new HashMap<>(classMethods.get(sup)));
-        }
-        for (Declaration d : cd.declarations) {
-            if (d instanceof FuncDef) {
-                FuncDef fd = (FuncDef) d;
-                if (!"__init__".equals(fd.name.name)) {
-                    methods.put(fd.name.name,
-                                DeclarationAnalyzer.funcTypeFromFuncDef(fd));
-                }
-            }
-        }
         classMethods.put(cn, methods);
 
         FuncDef init = findInit(cd);
@@ -229,28 +462,91 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         return false;
     }
 
-    private void processFuncDef(FuncDef fd) {
+    private void processFuncDef(FuncDef fd, String enclosingClassName) {
         SymbolTable<Type> savedSym = sym;
         Set<String> savedGlobals = currentGlobals;
+        Set<String> savedNonlocals = currentNonlocals;
+        Set<String> savedGlobalDeclSeen = globalDeclSeen;
         ValueType savedReturn = currentFunctionReturn;
         boolean savedInFunc = inFunction;
 
         sym = new SymbolTable<>(sym);
         currentGlobals = new HashSet<>();
+        currentNonlocals = new HashSet<>();
+        globalDeclSeen = new HashSet<>();
         currentFunctionReturn = ValueType.annotationToValueType(fd.returnType);
         inFunction = true;
+        functionStack.add(fd);
 
         try {
+            checkTypeAnnotation(fd.returnType);
             for (TypedVar p : fd.params) {
+                checkShadowClassName(p.identifier);
+                checkTypeAnnotation(p.type);
                 sym.put(p.identifier.name,
                         ValueType.annotationToValueType(p.type));
             }
+            if (enclosingClassName != null) {
+                checkMethodSelfParam(fd, enclosingClassName);
+            }
+
             for (Declaration d : fd.declarations) {
-                dispatchDeclInFunction(d);
+                if (d instanceof VarDef) {
+                    VarDef vd = (VarDef) d;
+                    checkShadowClassName(vd.var.identifier);
+                    checkTypeAnnotation(vd.var.type);
+                    if (sym.declares(vd.var.identifier.name)) {
+                        vd.var.identifier.setErrorMsg(
+                            "Duplicate declaration of identifier in same "
+                            + "scope: " + vd.var.identifier.name);
+                        err(vd.var.identifier,
+                            "Duplicate declaration of identifier in same "
+                            + "scope: %s",
+                            vd.var.identifier.name);
+                    } else {
+                        sym.put(vd.var.identifier.name,
+                                ValueType.annotationToValueType(vd.var.type));
+                    }
+                } else if (d instanceof FuncDef) {
+                    FuncDef inner = (FuncDef) d;
+                    checkShadowClassName(inner.name);
+                    checkTypeAnnotation(inner.returnType);
+                    for (TypedVar tp : inner.params) {
+                        checkTypeAnnotation(tp.type);
+                    }
+                    FuncType ft = DeclarationAnalyzer.funcTypeFromFuncDef(inner);
+                    if (sym.declares(inner.name.name)) {
+                        inner.name.setErrorMsg(
+                            "Duplicate declaration of identifier in same "
+                            + "scope: " + inner.name.name);
+                        err(inner.name,
+                            "Duplicate declaration of identifier in same "
+                            + "scope: %s",
+                            inner.name.name);
+                    } else {
+                        sym.put(inner.name.name, ft);
+                    }
+                }
+            }
+
+            for (Declaration d : fd.declarations) {
+                if (d instanceof VarDef) {
+                    VarDef vd = (VarDef) d;
+                    Type initType = vd.value.dispatch(this);
+                    ValueType vt = ValueType.annotationToValueType(vd.var.type);
+                    if (!isAssignable(vt, initType)) {
+                        err(vd.value, "Expected type `%s`; got type `%s`",
+                            vt, initType);
+                    }
+                } else if (d instanceof GlobalDecl) {
+                    dispatchGlobalDecl((GlobalDecl) d);
+                } else if (d instanceof NonLocalDecl) {
+                    dispatchNonLocalDecl((NonLocalDecl) d);
+                }
             }
             for (Declaration d : fd.declarations) {
                 if (d instanceof FuncDef) {
-                    processFuncDef((FuncDef) d);
+                    processFuncDef((FuncDef) d, null);
                 }
             }
             for (Stmt st : fd.statements) {
@@ -264,30 +560,63 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     fd.name.name);
             }
         } finally {
+            functionStack.remove(functionStack.size() - 1);
             sym = savedSym;
             currentGlobals = savedGlobals;
+            currentNonlocals = savedNonlocals;
+            globalDeclSeen = savedGlobalDeclSeen;
             currentFunctionReturn = savedReturn;
             inFunction = savedInFunc;
         }
     }
 
-    private void dispatchDeclInFunction(Declaration d) {
-        if (d instanceof VarDef) {
-            analyze((VarDef) d);
-        } else if (d instanceof FuncDef) {
-            FuncDef inner = (FuncDef) d;
-            FuncType ft = DeclarationAnalyzer.funcTypeFromFuncDef(inner);
-            if (sym.declares(inner.name.name)) {
-                err(inner.name,
-                    "Duplicate declaration of identifier in same scope: %s",
-                    inner.name.name);
-            } else {
-                sym.put(inner.name.name, ft);
+    private void dispatchGlobalDecl(GlobalDecl g) {
+        Identifier v = g.variable;
+        String name = v.name;
+        if (sym.declares(name)) {
+            v.setErrorMsg(
+                "Duplicate declaration of identifier in same scope: " + name);
+            err(v, "Duplicate declaration of identifier in same scope: %s",
+                name);
+            return;
+        }
+        if (globalDeclSeen.contains(name)) {
+            v.setErrorMsg(
+                "Duplicate declaration of identifier in same scope: " + name);
+            err(v, "Duplicate declaration of identifier in same scope: %s",
+                name);
+            return;
+        }
+        globalDeclSeen.add(name);
+        if (!moduleVarNames.contains(name)) {
+            v.setErrorMsg("Not a global variable: " + name);
+            err(v, "Not a global variable: %s", name);
+            return;
+        }
+        currentGlobals.add(name);
+    }
+
+    private void dispatchNonLocalDecl(NonLocalDecl n) {
+        Identifier v = n.variable;
+        String name = v.name;
+        if (functionStack.size() < 2) {
+            v.setErrorMsg("Not a nonlocal variable: " + name);
+            err(v, "Not a nonlocal variable: %s", name);
+            return;
+        }
+        boolean found = false;
+        for (int i = functionStack.size() - 2; i >= 0; i--) {
+            FuncDef enc = functionStack.get(i);
+            if (localVariableNames(enc).contains(name)) {
+                found = true;
+                break;
             }
-        } else if (d instanceof GlobalDecl) {
-            currentGlobals.add(((GlobalDecl) d).variable.name);
-        } else if (d instanceof NonLocalDecl) {
-            /* Reserved for full nonlocal checking. */
+        }
+        if (!found) {
+            v.setErrorMsg("Not a nonlocal variable: " + name);
+            err(v, "Not a nonlocal variable: %s", name);
+        } else {
+            currentNonlocals.add(name);
         }
     }
 
@@ -298,6 +627,39 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         classMethods.clear();
         classSuper.clear();
 
+        moduleVarNames.clear();
+        shadowForbiddenClassNames.clear();
+        shadowForbiddenClassNames.add("object");
+        shadowForbiddenClassNames.add("int");
+        shadowForbiddenClassNames.add("str");
+        shadowForbiddenClassNames.add("bool");
+        for (Declaration decl : program.declarations) {
+            if (decl instanceof ClassDef) {
+                shadowForbiddenClassNames.add(((ClassDef) decl).name.name);
+            }
+            if (decl instanceof VarDef) {
+                moduleVarNames.add(((VarDef) decl).var.identifier.name);
+            }
+        }
+
+        java.util.ArrayList<ValueType> objSelf = new java.util.ArrayList<>();
+        objSelf.add(OBJECT_TYPE);
+        classConstructorTypes.put("object", new FuncType(objSelf, NONE_TYPE));
+        classFields.put("object", new HashMap<>());
+        classMethods.put("object", new HashMap<>());
+
+        Set<String> classesDeclaredSoFar = new HashSet<>();
+        classesDeclaredSoFar.add("object");
+        classesDeclaredSoFar.add("int");
+        classesDeclaredSoFar.add("str");
+        classesDeclaredSoFar.add("bool");
+        for (Declaration decl : program.declarations) {
+            if (decl instanceof ClassDef) {
+                ClassDef cd = (ClassDef) decl;
+                validateClassSuper(cd, classesDeclaredSoFar);
+                classesDeclaredSoFar.add(cd.name.name);
+            }
+        }
         for (Declaration decl : program.declarations) {
             if (decl instanceof ClassDef) {
                 registerClassMetadata((ClassDef) decl);
@@ -316,13 +678,15 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(ClassDef classDef) {
         for (Declaration d : classDef.declarations) {
             if (d instanceof FuncDef) {
-                processFuncDef((FuncDef) d);
+                processFuncDef((FuncDef) d, classDef.name.name);
             } else if (d instanceof VarDef) {
                 VarDef vd = (VarDef) d;
+                checkShadowClassName(vd.var.identifier);
+                checkTypeAnnotation(vd.var.type);
                 Type initType = vd.value.dispatch(this);
                 ValueType vt = ValueType.annotationToValueType(vd.var.type);
                 if (!isAssignable(vt, initType)) {
-                    err(vd.value, "Expected type `%s`; got type `%s`",
+                    err(vd, "Expected type `%s`; got type `%s`",
                         vt, initType);
                 }
             }
@@ -332,7 +696,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
     @Override
     public Type analyze(FuncDef funcDef) {
-        processFuncDef(funcDef);
+        processFuncDef(funcDef, null);
         return null;
     }
 
@@ -344,6 +708,8 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
     @Override
     public Type analyze(VarDef varDef) {
+        checkShadowClassName(varDef.var.identifier);
+        checkTypeAnnotation(varDef.var.type);
         ValueType declaredType =
             ValueType.annotationToValueType(varDef.var.type);
         Type initType = varDef.value.dispatch(this);
@@ -351,17 +717,6 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         if (!isAssignable(declaredType, initType)) {
             err(varDef.value, "Expected type `%s`; got type `%s`",
                 declaredType, initType);
-        }
-
-        if (sym.getParent() != null) {
-            String name = varDef.var.identifier.name;
-            if (sym.declares(name)) {
-                err(varDef.var.identifier,
-                    "Duplicate declaration of identifier in same scope: %s",
-                    name);
-            } else {
-                sym.put(name, declaredType);
-            }
         }
 
         return null;
@@ -478,7 +833,8 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             Type targetType = target.dispatch(this);
             if (inFunction && target instanceof Identifier) {
                 String tname = ((Identifier) target).name;
-                if (!currentGlobals.contains(tname) && !sym.declares(tname)) {
+                if (!currentGlobals.contains(tname) && !sym.declares(tname)
+                    && !currentNonlocals.contains(tname)) {
                     err(target,
                         "Cannot assign to variable that is not explicitly "
                         + "declared in this scope: %s",
@@ -612,7 +968,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     if (!isAssignable(ctor.parameters.get(i + 1), argT)) {
                         err(node, "Expected type `%s`; got type `%s` in "
                             + "parameter %d",
-                            ctor.parameters.get(i + 1), argT, i);
+                            ctor.parameters.get(i + 1), argT, i + 1);
                     }
                 }
             }
@@ -636,9 +992,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         String mname = m.member.name;
         FuncType ft = ms != null ? ms.get(mname) : null;
         if (ft == null) {
-            err(node, "Class `%s` has no method `%s`", cname, mname);
+            node.setErrorMsg(
+                "There is no method named `" + mname + "` in class `" + cname
+                + "`");
+            err(node, "There is no method named `%s` in class `%s`",
+                mname, cname);
             return node.setInferredType(OBJECT_TYPE);
         }
+        m.setInferredType(ft);
         int need = ft.parameters.size() - 1;
         if (need != node.args.size()) {
             err(node, "Expected %d arguments; got %d", need, node.args.size());
@@ -647,7 +1008,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 Type argT = node.args.get(i).dispatch(this);
                 if (!isAssignable(ft.parameters.get(i + 1), argT)) {
                     err(node, "Expected type `%s`; got type `%s` in parameter %d",
-                        ft.parameters.get(i + 1), argT, i);
+                        ft.parameters.get(i + 1), argT, i + 1);
                 }
             }
         }
@@ -664,11 +1025,13 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         String cname = ((ClassValueType) ot).className();
         ValueType ft = lookupField(cname, e.member.name);
         if (ft == null) {
-            err(e.member, "Unknown attribute `%s` on class `%s`",
+            e.setErrorMsg(
+                "There is no attribute named `" + e.member.name
+                + "` in class `" + cname + "`");
+            err(e, "There is no attribute named `%s` in class `%s`",
                 e.member.name, cname);
             return e.setInferredType(OBJECT_TYPE);
         }
-        e.member.setInferredType(ft);
         return e.setInferredType(ft);
     }
 
