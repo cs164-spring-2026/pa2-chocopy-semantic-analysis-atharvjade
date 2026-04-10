@@ -5,17 +5,21 @@ import chocopy.common.analysis.SymbolTable;
 import chocopy.common.analysis.types.Type;
 import chocopy.common.analysis.types.ValueType;
 import chocopy.common.astnodes.BinaryExpr;
+import chocopy.common.astnodes.BooleanLiteral;
 import chocopy.common.astnodes.Declaration;
 import chocopy.common.astnodes.Errors;
 import chocopy.common.astnodes.ExprStmt;
 import chocopy.common.astnodes.Identifier;
 import chocopy.common.astnodes.IntegerLiteral;
 import chocopy.common.astnodes.Node;
+import chocopy.common.astnodes.NoneLiteral;
 import chocopy.common.astnodes.Program;
 import chocopy.common.astnodes.Stmt;
 import chocopy.common.astnodes.VarDef;
 
+import static chocopy.common.analysis.types.Type.BOOL_TYPE;
 import static chocopy.common.analysis.types.Type.INT_TYPE;
+import static chocopy.common.analysis.types.Type.NONE_TYPE;
 import static chocopy.common.analysis.types.Type.OBJECT_TYPE;
 
 /** Analyzer that performs ChocoPy type checks on all nodes.  Applied after
@@ -80,11 +84,22 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     @Override
+    public Type analyze(BooleanLiteral b) {
+        return b.setInferredType(BOOL_TYPE);
+    }
+
+    @Override
+    public Type analyze(NoneLiteral n) {
+        return n.setInferredType(NONE_TYPE);
+    }
+
+    @Override
     public Type analyze(BinaryExpr e) {
         Type t1 = e.left.dispatch(this);
         Type t2 = e.right.dispatch(this);
 
         switch (e.operator) {
+        case "+":
         case "-":
         case "*":
         case "//":
@@ -95,6 +110,43 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                     e.operator, t1, t2);
                 return e.setInferredType(INT_TYPE);
+            }
+        case "<":
+        case "<=":
+        case ">":
+        case ">=":
+            if (INT_TYPE.equals(t1) && INT_TYPE.equals(t2)) {
+                return e.setInferredType(BOOL_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
+                    e.operator, t1, t2);
+                return e.setInferredType(BOOL_TYPE);
+            }
+        case "==":
+        case "!=":
+            if (t1 != null && t1.equals(t2) && !NONE_TYPE.equals(t1)) {
+                return e.setInferredType(BOOL_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
+                    e.operator, t1, t2);
+                return e.setInferredType(BOOL_TYPE);
+            }
+        case "and":
+        case "or":
+            if (BOOL_TYPE.equals(t1) && BOOL_TYPE.equals(t2)) {
+                return e.setInferredType(BOOL_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
+                    e.operator, t1, t2);
+                return e.setInferredType(BOOL_TYPE);
+            }
+        case "is":
+            if (!t1.isSpecialType() && !t2.isSpecialType()) {
+                return e.setInferredType(BOOL_TYPE);
+            } else {
+                err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
+                    e.operator, t1, t2);
+                return e.setInferredType(BOOL_TYPE);
             }
         default:
             return e.setInferredType(OBJECT_TYPE);
