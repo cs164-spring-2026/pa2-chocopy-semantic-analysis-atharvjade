@@ -205,7 +205,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     private boolean needsReturnOnAllPaths(ValueType ret) {
-        return !NONE_TYPE.equals(ret);
+        return ret.isSpecialType();
     }
 
     private boolean blockReturnsFully(List<Stmt> stmts) {
@@ -247,6 +247,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             }
             for (Declaration d : fd.declarations) {
                 dispatchDeclInFunction(d);
+            }
+            for (Declaration d : fd.declarations) {
+                if (d instanceof FuncDef) {
+                    processFuncDef((FuncDef) d);
+                }
             }
             for (Stmt st : fd.statements) {
                 st.dispatch(this);
@@ -393,12 +398,15 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 return e.setInferredType(INT_TYPE);
             } else if (STR_TYPE.equals(t1) && STR_TYPE.equals(t2)) {
                 return e.setInferredType(STR_TYPE);
-            } else if ((t1.isListType() || Type.EMPTY_TYPE.equals(t1))
-                       && (t2.isListType() || Type.EMPTY_TYPE.equals(t2))) {
+            } else if (t1.isListType() && t2.isListType()) {
                 return e.setInferredType(joinTypes(t1, t2));
             } else {
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                     e.operator, t1, t2);
+                if (t1.isListType() || t2.isListType()
+                    || Type.EMPTY_TYPE.equals(t1) || Type.EMPTY_TYPE.equals(t2)) {
+                    return e.setInferredType(OBJECT_TYPE);
+                }
                 return e.setInferredType(INT_TYPE);
             }
         case "-":
@@ -458,6 +466,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(AssignStmt stmt) {
         Type valueType = stmt.value.dispatch(this);
+        boolean emittedAssignTypeError = false;
         for (Expr target : stmt.targets) {
             if (target instanceof IndexExpr) {
                 Type listType = ((IndexExpr) target).list.dispatch(this);
@@ -467,10 +476,21 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 }
             }
             Type targetType = target.dispatch(this);
+            if (inFunction && target instanceof Identifier) {
+                String tname = ((Identifier) target).name;
+                if (!currentGlobals.contains(tname) && !sym.declares(tname)) {
+                    err(target,
+                        "Cannot assign to variable that is not explicitly "
+                        + "declared in this scope: %s",
+                        tname);
+                }
+            }
             if (!isAssignable(targetType, valueType)) {
-                err(stmt, "Expected type `%s`; got type `%s`",
-                    targetType, valueType);
-                break;
+                if (!emittedAssignTypeError) {
+                    err(stmt, "Expected type `%s`; got type `%s`",
+                        targetType, valueType);
+                    emittedAssignTypeError = true;
+                }
             }
         }
         return null;
@@ -517,20 +537,16 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             err(stmt.iterable, "Cannot iterate over type `%s`", iterType);
             elemType = OBJECT_TYPE;
         }
-        SymbolTable<Type> saved = sym;
-        sym = new SymbolTable<>(sym);
-        String iname = stmt.identifier.name;
-        if (sym.declares(iname)) {
-            err(stmt.identifier,
-                "Duplicate declaration of identifier in same scope: %s",
-                iname);
-        } else {
-            sym.put(iname, elemType);
+
+        Type idType = stmt.identifier.dispatch(this);
+        if (!isAssignable(idType, elemType)) {
+            err(stmt.identifier, "Expected type `%s`; got type `%s`",
+                idType, elemType);
         }
+        stmt.identifier.setInferredType(idType);
         for (Stmt s : stmt.body) {
             s.dispatch(this);
         }
-        sym = saved;
         return null;
     }
 
