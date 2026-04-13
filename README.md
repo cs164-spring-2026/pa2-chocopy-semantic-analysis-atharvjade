@@ -80,7 +80,8 @@ via `--pass=.r` to compare outputs on our own test programs).
 
 ### Late submission
 
-No late hours were consumed on this assignment.
+1 slip hour was used on this assignment (66 previously used → 67 total
+used, 33 remaining).
 
 ### Q1: Number of passes and their purpose
 
