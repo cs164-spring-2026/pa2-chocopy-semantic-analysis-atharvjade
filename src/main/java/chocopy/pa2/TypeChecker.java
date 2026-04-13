@@ -535,7 +535,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     Type initType = vd.value.dispatch(this);
                     ValueType vt = ValueType.annotationToValueType(vd.var.type);
                     if (!isAssignable(vt, initType)) {
-                        err(vd.value, "Expected type `%s`; got type `%s`",
+                        err(vd, "Expected type `%s`; got type `%s`",
                             vt, initType);
                     }
                 } else if (d instanceof GlobalDecl) {
@@ -715,7 +715,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         Type initType = varDef.value.dispatch(this);
 
         if (!isAssignable(declaredType, initType)) {
-            err(varDef.value, "Expected type `%s`; got type `%s`",
+            err(varDef, "Expected type `%s`; got type `%s`",
                 declaredType, initType);
         }
 
@@ -758,11 +758,10 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             } else {
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                     e.operator, t1, t2);
-                if (t1.isListType() || t2.isListType()
-                    || Type.EMPTY_TYPE.equals(t1) || Type.EMPTY_TYPE.equals(t2)) {
-                    return e.setInferredType(OBJECT_TYPE);
+                if (INT_TYPE.equals(t1) || INT_TYPE.equals(t2)) {
+                    return e.setInferredType(INT_TYPE);
                 }
-                return e.setInferredType(INT_TYPE);
+                return e.setInferredType(OBJECT_TYPE);
             }
         case "-":
         case "*":
@@ -788,7 +787,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             }
         case "==":
         case "!=":
-            if (t1 != null && t1.equals(t2) && !NONE_TYPE.equals(t1)) {
+            if (t1 != null && t1.equals(t2)
+                && (INT_TYPE.equals(t1) || STR_TYPE.equals(t1)
+                    || BOOL_TYPE.equals(t1))) {
                 return e.setInferredType(BOOL_TYPE);
             } else {
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
@@ -824,8 +825,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         boolean emittedAssignTypeError = false;
         for (Expr target : stmt.targets) {
             if (target instanceof IndexExpr) {
-                Type listType = ((IndexExpr) target).list.dispatch(this);
+                IndexExpr ix = (IndexExpr) target;
+                Type listType = ix.list.dispatch(this);
                 if (STR_TYPE.equals(listType)) {
+                    ix.index.dispatch(this);
+                    target.setInferredType(STR_TYPE);
                     err(target, "`str` is not a list type");
                     continue;
                 }
@@ -856,7 +860,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(IfStmt stmt) {
         Type condType = stmt.condition.dispatch(this);
         if (!BOOL_TYPE.equals(condType)) {
-            err(stmt.condition, "Condition expression cannot be of type `%s`",
+            err(stmt, "Condition expression cannot be of type `%s`",
                 condType);
         }
         for (Stmt s : stmt.thenBody) {
@@ -872,7 +876,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(WhileStmt stmt) {
         Type condType = stmt.condition.dispatch(this);
         if (!BOOL_TYPE.equals(condType)) {
-            err(stmt.condition, "Condition expression cannot be of type `%s`",
+            err(stmt, "Condition expression cannot be of type `%s`",
                 condType);
         }
         for (Stmt s : stmt.body) {
@@ -885,21 +889,34 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(ForStmt stmt) {
         Type iterType = stmt.iterable.dispatch(this);
         ValueType elemType;
+        boolean iterOk = true;
         if (STR_TYPE.equals(iterType)) {
             elemType = STR_TYPE;
         } else if (iterType.isListType()) {
             elemType = ((ListValueType) iterType).elementType();
         } else {
-            err(stmt.iterable, "Cannot iterate over type `%s`", iterType);
+            err(stmt, "Cannot iterate over value of type `%s`", iterType);
             elemType = OBJECT_TYPE;
+            iterOk = false;
         }
 
-        Type idType = stmt.identifier.dispatch(this);
-        if (!isAssignable(idType, elemType)) {
-            err(stmt.identifier, "Expected type `%s`; got type `%s`",
+        String idName = stmt.identifier.name;
+        Type idType;
+        if (inFunction && currentGlobals.contains(idName)) {
+            idType = globals.get(idName);
+        } else {
+            idType = sym.get(idName);
+        }
+        if (idType == null || !idType.isValueType()) {
+            err(stmt.identifier, "Not a variable: %s", idName);
+            idType = OBJECT_TYPE;
+        } else if (iterOk && !isAssignable(idType, elemType)) {
+            err(stmt, "Expected type `%s`; got type `%s`",
                 idType, elemType);
         }
-        stmt.identifier.setInferredType(idType);
+        if (iterOk && isAssignable(idType, elemType)) {
+            stmt.identifier.setInferredType((ValueType) idType);
+        }
         for (Stmt s : stmt.body) {
             s.dispatch(this);
         }
@@ -936,6 +953,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             FuncType ft = (FuncType) calleeT;
             node.function.setInferredType(ft);
             if (ft.parameters.size() != node.args.size()) {
+                for (Expr arg : node.args) {
+                    arg.dispatch(this);
+                }
                 err(node, "Expected %d arguments; got %d",
                     ft.parameters.size(), node.args.size());
             } else {
@@ -955,11 +975,17 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             ClassValueType cv = (ClassValueType) calleeT;
             FuncType ctor = classConstructorTypes.get(cv.className());
             if (ctor == null) {
+                for (Expr arg : node.args) {
+                    arg.dispatch(this);
+                }
                 err(node, "Not a function or class: %s", fname);
                 return node.setInferredType(OBJECT_TYPE);
             }
             int userParams = ctor.parameters.size() - 1;
             if (userParams != node.args.size()) {
+                for (Expr arg : node.args) {
+                    arg.dispatch(this);
+                }
                 err(node, "Expected %d arguments; got %d",
                     userParams, node.args.size());
             } else {
@@ -975,6 +1001,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             return node.setInferredType(cv);
         }
 
+        for (Expr arg : node.args) {
+            arg.dispatch(this);
+        }
         err(node, "Not a function or class: %s", fname);
         return node.setInferredType(OBJECT_TYPE);
     }
@@ -992,6 +1021,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         String mname = m.member.name;
         FuncType ft = ms != null ? ms.get(mname) : null;
         if (ft == null) {
+            for (Expr arg : node.args) {
+                arg.dispatch(this);
+            }
             node.setErrorMsg(
                 "There is no method named `" + mname + "` in class `" + cname
                 + "`");
@@ -1002,6 +1034,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         m.setInferredType(ft);
         int need = ft.parameters.size() - 1;
         if (need != node.args.size()) {
+            for (Expr arg : node.args) {
+                arg.dispatch(this);
+            }
             err(node, "Expected %d arguments; got %d", need, node.args.size());
         } else {
             for (int i = 0; i < node.args.size(); i++) {
@@ -1019,7 +1054,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(MemberExpr e) {
         Type ot = e.object.dispatch(this);
         if (!(ot instanceof ClassValueType)) {
-            err(e.object, "Invalid object type `%s`", ot);
+            err(e, "Cannot access member of non-class type `%s`", ot);
             return e.setInferredType(OBJECT_TYPE);
         }
         String cname = ((ClassValueType) ot).className();
@@ -1066,7 +1101,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         Type thenType = e.thenExpr.dispatch(this);
         Type elseType = e.elseExpr.dispatch(this);
         if (!BOOL_TYPE.equals(condType)) {
-            err(e.condition, "Condition expression cannot be of type `%s`",
+            err(e, "Condition expression cannot be of type `%s`",
                 condType);
         }
         return e.setInferredType(joinTypes(thenType, elseType));

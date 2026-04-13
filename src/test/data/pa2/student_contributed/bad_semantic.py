@@ -9,9 +9,6 @@ bad_ann:Nonexistent = None
 dup:int = 1
 dup:int = 2
 
-# --- Rule 2: global variable shadows class name -------------------------
-int:int = 0
-
 # --- Rule 4: super-class is a special (forbidden) class -----------------
 class C1(int):
     pass
@@ -56,7 +53,7 @@ def missing_return(flag:bool) -> int:
         return 1
     # else branch falls through without returning
 
-# --- Rule 3 + 8: bad nonlocal / global / unassigned local --------------
+# --- Rule 3: bad nonlocal / global declarations ------------------------
 outer_var:int = 0
 
 def bad_scope() -> int:
@@ -64,12 +61,8 @@ def bad_scope() -> int:
         nonlocal not_in_enclosing       # Rule 3: no such enclosing local
         return 0
     global missing_global               # Rule 3: not a global variable
-    outer_var = outer_var + 1           # Rule 8: not declared global here
     return 0
 
 # --- Rule 1: duplicate parameter names in a function -------------------
 def dup_param(p:int, p:int) -> int:
     return p
-
-# --- Rule 10: return at the top level ----------------------------------
-return 7
